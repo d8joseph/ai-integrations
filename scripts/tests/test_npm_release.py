@@ -1,0 +1,203 @@
+"""npm release ordering, artifact identity, and fail-closed registry verification."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import io
+import json
+import os
+import subprocess
+import tarfile
+import urllib.error
+from pathlib import Path
+
+import pytest
+import yaml
+
+import npm_release
+import release_tool
+
+
+@pytest.mark.parametrize("version", ["0.1.0rc1", "0.1.0.dev1", "01.0.0", "0.1.0-rc.01", "0.1.0+build", "v0.1.0"])
+def test_npm_rejects_noncanonical_versions(version: str) -> None:
+    with pytest.raises(release_tool.PolicyError, match="npm version"):
+        release_tool.parse_tag(f"typescript/google-adk/v{version}")
+
+
+def test_npm_uses_semver_order_including_numeric_and_arbitrary_prereleases(tmp_path: Path) -> None:
+    versions = ["0.1.0-rc.10", "0.1.0-rc.2", "0.1.0", "0.1.0-zeta", "0.1.0-1"]
+    data = tmp_path / "registry.json"
+    data.write_text(json.dumps({"name": "@temporalio/fake", "versions": {v: {"deprecated": "old"} for v in versions}}))
+    published = release_tool.fetch_published_versions("@temporalio/fake", "npm", data)
+    assert [str(v) for v in sorted(published)] == ["0.1.0-1", "0.1.0-rc.2", "0.1.0-rc.10", "0.1.0-zeta", "0.1.0"]
+    with pytest.raises(release_tool.PolicyError, match="newest published"):
+        release_tool.check_policy(npm_release.NpmVersion("0.1.0-rc.11"), "public-preview", published)
+    assert release_tool.check_policy(npm_release.NpmVersion("0.1.0"), "public-preview", []) is None
+    with pytest.raises(release_tool.PolicyError, match="first release"):
+        release_tool.check_policy(npm_release.NpmVersion("1.0.0"), "public-preview", [])
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_registry_errors_are_never_treated_as_unpublished(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
+    def fail(*args, **kwargs):
+        raise urllib.error.HTTPError("https://registry.npmjs.org", status, "failed", {}, None)
+    monkeypatch.setattr(npm_release.urllib.request, "urlopen", fail)
+    with pytest.raises(npm_release.NpmReleaseError, match=f"HTTP {status}"):
+        npm_release.fetch_versions("@temporalio/fake")
+
+
+def test_only_registry_404_means_new_coordinate(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing(*args, **kwargs):
+        raise urllib.error.HTTPError("https://registry.npmjs.org", 404, "missing", {}, None)
+    monkeypatch.setattr(npm_release.urllib.request, "urlopen", missing)
+    assert npm_release.fetch_versions("@temporalio/fake") == []
+
+
+def tarball(dist: Path, **overrides) -> Path:
+    dist.mkdir(exist_ok=True)
+    path = dist / "fake.tgz"
+    package = {"name": "@temporalio/fake", "version": "0.1.0", **overrides}
+    payload = json.dumps(package).encode()
+    with tarfile.open(path, "w:gz") as archive:
+        member = tarfile.TarInfo("package/package.json")
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+    return path
+
+
+def metadata(path: Path) -> dict:
+    payload = path.read_bytes()
+    return {"name": "@temporalio/fake", "version": "0.1.0", "dist": {
+        "integrity": "sha512-" + base64.b64encode(hashlib.sha512(payload).digest()).decode(),
+        "shasum": hashlib.sha1(payload).hexdigest(),
+        "tarball": "https://registry.npmjs.org/@temporalio/fake/-/fake-0.1.0.tgz",
+    }}
+
+
+@pytest.mark.parametrize("overrides", [{"private": True}, {"version": "0.0.0"}, {"name": "@temporalio/other"}])
+def test_wrong_or_private_tarball_cannot_be_published(tmp_path: Path, overrides: dict) -> None:
+    tarball(tmp_path, **overrides)
+    with pytest.raises(npm_release.NpmReleaseError, match="does not match"):
+        npm_release.artifact(tmp_path, "@temporalio/fake", "0.1.0")
+
+
+def test_rerun_requires_matching_registry_hashes_and_served_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tarball(tmp_path)
+    info = metadata(path)
+    monkeypatch.setattr(npm_release, "fetch_package", lambda *args: {"name": "@temporalio/fake", "versions": {"0.1.0": info}})
+    monkeypatch.setattr(npm_release.urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(path.read_bytes()))
+    assert npm_release.registry_state("@temporalio/fake", "0.1.0", tmp_path)
+    monkeypatch.setattr(npm_release.urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(b"different bytes"))
+    with pytest.raises(npm_release.NpmReleaseError, match="different bytes"):
+        npm_release.registry_state("@temporalio/fake", "0.1.0", tmp_path)
+    info["dist"]["integrity"] = "sha512-wrong"
+    with pytest.raises(npm_release.NpmReleaseError, match="hashes differ"):
+        npm_release.registry_state("@temporalio/fake", "0.1.0", tmp_path)
+
+
+@pytest.mark.parametrize("override", [{"deprecated": "withdrawn"}, {"version": "0.1.1"}, {"name": "@temporalio/other"}])
+def test_registry_identity_and_deprecation_are_verified(tmp_path: Path, override: dict) -> None:
+    path = tarball(tmp_path)
+    with pytest.raises(npm_release.NpmReleaseError, match="identity differs"):
+        npm_release.verify_artifact({**metadata(path), **override}, path, "@temporalio/fake", "0.1.0")
+
+
+def test_tarball_host_must_be_the_public_npm_registry(tmp_path: Path) -> None:
+    path = tarball(tmp_path)
+    info = metadata(path)
+    info["dist"]["tarball"] = "https://other.example/fake.tgz"
+    with pytest.raises(npm_release.NpmReleaseError, match="must be served"):
+        npm_release.verify_artifact(info, path, "@temporalio/fake", "0.1.0")
+
+
+def test_missing_version_skips_upload_only_when_not_required(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tarball(tmp_path)
+    monkeypatch.setattr(npm_release, "fetch_package", lambda *args: None)
+    args = ["npm-registry-state", "--coordinate", "@temporalio/fake", "--version", "0.1.0", "--dist", str(tmp_path),
+            "--github-output", str(tmp_path / "output")]
+    assert release_tool.main(args) == 0
+    assert (tmp_path / "output").read_text() == "exists=false\n"
+    assert release_tool.main([*args, "--require-present"]) == 1
+
+
+def test_registry_propagation_is_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    responses = iter([False, True])
+    monkeypatch.setattr(release_tool, "registry_state", lambda *args: next(responses))
+    args = ["npm-registry-state", "--coordinate", "@temporalio/fake", "--version", "0.1.0", "--dist", str(tmp_path),
+            "--require-present", "--attempts", "2", "--delay", "0", "--github-output", str(tmp_path / "output")]
+    assert release_tool.main(args) == 0
+    assert (tmp_path / "output").read_text() == "exists=true\n"
+
+
+WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/release-typescript.yml"
+
+
+@pytest.mark.parametrize("ref_type,skip,expected", [
+    ("branch", "false", "false"), ("branch", "true", "false"),
+    ("tag", "true", "false"), ("tag", "", "false"), ("tag", "false", "true"),
+])
+def test_only_tagged_non_dry_runs_publish(tmp_path: Path, ref_type: str, skip: str, expected: str) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    gate = next(step for step in workflow["jobs"]["prepare"]["steps"] if step.get("id") == "gate")
+    (tmp_path / "package.json").write_text('{"private": false}')
+    output = tmp_path / "output"
+    env = dict(os.environ, REF_TYPE=ref_type, SKIP_PUBLISH=skip, PLUGIN_DIR=".", GITHUB_OUTPUT=str(output))
+    result = subprocess.run(["bash", "-c", gate["run"]], env=env, cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert output.read_text() == f"publish={expected}\n"
+
+
+def test_npm_publishes_only_the_full_matrix_artifact_with_oidc() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    assert workflow["permissions"] == {}
+    assert "push" not in workflow[True]
+    assert workflow[True]["release"]["types"] == ["published"]
+    test = workflow["jobs"]["test"]
+    assert test["uses"] == "./.github/workflows/_typescript-plugin.yml"
+    assert test["with"]["deps"] == "locked"
+    assert test["with"]["ref"] == "${{ needs.prepare.outputs.sha }}"
+    publish = workflow["jobs"]["publish"]
+    assert publish["needs"] == ["prepare", "test"]
+    assert publish["if"] == "needs.prepare.outputs.publish == 'true'"
+    assert publish["permissions"] == {"contents": "read", "actions": "read", "id-token": "write"}
+    assert publish["environment"]["name"] == "npm"
+    download = next(step for step in publish["steps"] if "download-artifact@" in step.get("uses", ""))
+    assert download["with"]["name"] == test["with"]["artifact-name"]
+    upload = next(step for step in publish["steps"] if "npm publish" in step.get("run", ""))
+    assert upload["if"] == "steps.existing.outputs.exists == 'false'"
+    assert '"$PLUGIN_DIR"/dist/*.tgz' in upload["run"]
+    assert not any("make build" in step.get("run", "") for step in publish["steps"])
+    commands = "\n".join(step.get("run", "") for step in publish["steps"])
+    assert "--require-present" in commands and "smoke.mjs" in commands
+    reusable = yaml.safe_load(WORKFLOW.with_name("_typescript-plugin.yml").read_text())
+    for job in reusable["jobs"].values():
+        checkout = next(step for step in job["steps"] if "checkout@" in step.get("uses", ""))
+        assert checkout["with"]["ref"] == "${{ inputs.ref || github.sha }}"
+    steps = reusable["jobs"]["test"]["steps"]
+    inject = next(i for i, step in enumerate(steps) if step.get("name") == "Inject release version")
+    lint = next(i for i, step in enumerate(steps) if step.get("name") == "Lint and test")
+    assert inject < lint
+
+
+def test_private_package_cannot_pass_publication_gate(tmp_path: Path) -> None:
+    gate = next(step for step in yaml.safe_load(WORKFLOW.read_text())["jobs"]["prepare"]["steps"] if step.get("id") == "gate")
+    (tmp_path / "package.json").write_text('{"private": true}')
+    output = tmp_path / "output"
+    env = dict(os.environ, REF_TYPE="tag", SKIP_PUBLISH="false", PLUGIN_DIR=".", GITHUB_OUTPUT=str(output))
+    result = subprocess.run(["bash", "-c", gate["run"]], env=env, cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode != 0 and not output.exists()
+
+
+def test_npm_tagged_source_must_be_on_main(plugin_repo: Path, tmp_path: Path) -> None:
+    from conftest import commit_all, git
+
+    git(plugin_repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    (plugin_repo / "README.md").write_text("unmerged change")
+    commit_all(plugin_repo, "Unmerged feature")
+    tag = "typescript/fake/v0.1.0"
+    git(plugin_repo, "tag", "-a", tag, "-m", "unmerged release")
+    source = next(step for step in yaml.safe_load(WORKFLOW.read_text())["jobs"]["prepare"]["steps"] if step.get("id") == "source")
+    env = dict(os.environ, REF_TYPE="tag", TAG=tag, GITHUB_OUTPUT=str(tmp_path / "output"))
+    result = subprocess.run(["bash", "-c", source["run"]], env=env, cwd=plugin_repo, capture_output=True, text=True)
+    assert result.returncode != 0 and "release tags must be on main" in result.stdout

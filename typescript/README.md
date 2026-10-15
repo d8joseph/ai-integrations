@@ -49,7 +49,11 @@ Its telemetry test explicitly registers a tracing provider and an in-memory
 exporter. The test environments omit the unused OpenTelemetry Node SDK and its
 Jaeger/Prometheus dependencies.
 
-The development version is `0.0.0`. Packages remain private and final releases
-disabled until the shared npm publication workflow and trusted publishers are
-configured. The history import and ownership cutover do not publish anything.
-See [AGENTS.md](../AGENTS.md) and the [import log](../scripts/migrate/IMPORTS.md).
+The development version is `0.0.0`. The shared `release-typescript.yml` workflow
+tests the tagged version across the full matrix, then publishes its tested npm
+tarball through trusted publishing and verifies the public bytes and consumer
+installation. Google ADK is enabled for its first Public Preview release, `0.1.0`;
+the other packages remain private with final releases disabled. A new npm package
+requires one interactive publication of the tested artifact before its trusted
+publisher can be configured. See the [TypeScript release runbook](../AGENTS.md#typescript-releases)
+and the [import log](../scripts/migrate/IMPORTS.md).

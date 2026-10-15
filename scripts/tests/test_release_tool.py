@@ -20,7 +20,7 @@ def test_parse_tag_valid() -> None:
         "prerelease": "true", "plugin_dir": "python/openai_agents",
     }
     assert release_tool.parse_tag("go/googleadk/v0.3.0")["prerelease"] == "false"
-    assert release_tool.parse_tag("typescript/vercel-ai-sdk/v1.0.0.dev1")["prerelease"] == "true"
+    assert release_tool.parse_tag("typescript/vercel-ai-sdk/v1.0.0-dev.1")["prerelease"] == "true"
     java = release_tool.parse_tag("java/spring-ai/v0.1.0-RC1")
     assert java["version"] == "0.1.0-RC1" and java["prerelease"] == "true"
     assert release_tool.parse_tag("java/spring-ai/v0.1.0")["prerelease"] == "false"

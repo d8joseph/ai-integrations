@@ -150,9 +150,12 @@ Workflow streams and OpenTelemetry never migrate here.
   Vercel and Google ADK use `@temporalio/vercel-ai-sdk` and `@temporalio/google-adk`.
   Activity names remain unchanged. The Google ADK random-stream identifier uses
   the new package name as explicitly requested for this cutover.
-- Packages remain private and `[release] allow-final = false` until shared npm
-  publication tooling and trusted publishers are configured. No per-plugin
-  workflows or secrets. CI checks tarball contents and a clean consumer import.
+- Packages remain private and `[release] allow-final = false` until their release
+  setup is ready. The shared npm workflow is `release-typescript.yml`; Google ADK
+  is enabled for its first release. New coordinates require one interactive
+  publication of the tested tarball before npm permits configuring their trusted
+  publisher, as described below. No per-plugin workflows or secrets. CI checks
+  tarball contents and a clean consumer import.
 
 ## CI
 
@@ -213,6 +216,50 @@ draft does not hide the tag from Go consumers. Run the dry run before tagging:
 5. For a proxy or consumer verification failure, re-run failed jobs or dispatch
    `release-go.yml` on the same tag ref with no tag input. Never move or delete
    the tag. A missing vanity mapping must be repaired before retrying.
+
+### TypeScript releases
+
+`.github/workflows/release-typescript.yml` handles every npm plugin. Published
+GitHub Releases trigger publication; tag pushes alone do not. Branch dispatches
+always run a dry run, even when `skip-publish` is false. npm versions are canonical
+SemVer without build metadata, such as `0.1.0` or `0.1.0-rc.1`. Registry ordering
+includes deprecated releases; the newest exact version may be verified again.
+Final versions require `allow-final = true` and no cutover markers. Keep the
+committed development version `0.0.0`.
+
+1. Configure the shared GitHub environment `npm` to accept only
+   `typescript/*/v*` tags and include that pattern in the immutable release-tag
+   ruleset. Existing packages register a trusted publisher for GitHub repository
+   `temporalio/ai-integrations`, workflow `release-typescript.yml`, environment
+   `npm`, with direct `npm publish` allowed. No stored npm tokens are used.
+   The `npm` environment and TypeScript tag protections were configured on
+   2026-10-15; a new coordinate's npm-side publisher still follows step 4.
+2. Merge release changes to main. Dry-run with
+   `gh workflow run release-typescript.yml --ref main -f tag=typescript/<name>/v<version>`.
+   The full Node/platform matrix tests the injected version at one pinned commit;
+   Ubuntu/max packs, checks and smoke-installs the tarball and saves
+   `npm-dist-<name>` as an Actions artifact.
+3. Create and push an annotated `typescript/<name>/v<version>` tag on that exact
+   tested main commit. Generate notes with the shared `release-notes` command and
+   create a draft GitHub Release for the existing tag. Use the GitHub pre-release
+   flag for prerelease versions or Pre-release maturity.
+4. For a new npm coordinate only, npm requires the package to exist before a
+   trusted publisher can be registered. Download the successful dry run's tested
+   tarball, authenticate interactively with an authorized npm account and publish
+   those exact bytes using `npm publish <tarball> --access public --tag latest
+   --ignore-scripts` (use `next` for prerelease versions). Then register the trusted
+   publisher with `npm trust github @temporalio/<name> --repo temporalio/ai-integrations
+   --file release-typescript.yml --env npm --allow-publish`. Complete any npm 2FA
+   challenge interactively. Do not upload a placeholder package or add a token.
+5. Publish the reviewed GitHub Release, or dispatch the workflow on its tag ref.
+   After the full matrix succeeds, the inline OIDC job publishes the tested
+   tarball to `latest` for final versions or `next` for prereleases, verifies npm's
+   SHA-512/SHA-1 metadata and downloaded bytes, and installs that public version
+   in a clean consumer. It leaves the reviewed GitHub Release unchanged.
+6. Re-run failed jobs after an upload. An existing version is skipped only when
+   its registry hashes and served bytes equal the tested tarball. A new run
+   rebuilds and must pass the same byte check. A mismatch requires fixing forward
+   with a new version; never move a tag or replace an uploaded artifact.
 
 ### Python releases
 

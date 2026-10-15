@@ -11,6 +11,7 @@ Subcommands:
   check-published-release       verify the published GitHub release and emit its deployment URL
   check-go-vanity               verify the Go vanity path routes to this plugin's subdirectory
   verify-go-module              compare public Go module bytes and build a clean consumer
+  npm-registry-state           verify existing npm bytes before skipping an upload
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
   publish-release               publish the reviewed draft after registry verification
@@ -23,7 +24,7 @@ Policy (AGENTS.md, "Release runbook"):
   * final (non pre-release) versions additionally require plugin.toml
     [release] allow-final = true and no TRANSITION(sdk-cutover) markers in the plugin
   * Python versions are canonical PEP 440; Java versions are X.Y.Z[-RCN];
-    Go versions are canonical SemVer; local versions and build metadata (+...) are forbidden
+    Go and TypeScript versions are canonical SemVer; local versions and build metadata (+...) are forbidden
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from urllib.parse import quote
 from packaging.version import InvalidVersion, Version
 
 from go_release import GoReleaseError, GoVersion, check_vanity, fetch_versions, verify_module
+from npm_release import NpmReleaseError, NpmVersion, fetch_versions as fetch_npm_versions, registry_state
 
 # \Z (not $) so a trailing newline cannot ride along into GITHUB_OUTPUT.
 TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go)/(?P<plugin>[a-z0-9][a-z0-9_.-]*)/v(?P<version>.+)\Z")
@@ -99,6 +101,11 @@ def _repo() -> str:
 
 
 def release_version(language: str, raw: str) -> Version | GoVersion:
+    if language == "typescript":
+        try:
+            return NpmVersion(raw)
+        except NpmReleaseError as exc:
+            raise PolicyError(str(exc)) from exc
     if language == "go":
         try:
             return GoVersion(raw)
@@ -139,8 +146,9 @@ def parse_tag(tag: str) -> dict[str, str]:
 def cmd_parse_tag(args: argparse.Namespace) -> int:
     out = parse_tag(args.tag)
     plugin_toml = Path(args.repo_root) / out["plugin_dir"] / "plugin.toml"
-    if out["language"] == "go" and not plugin_toml.is_file():
-        raise PolicyError(f"unknown Go plugin: {out['plugin_dir']}")
+    if out["language"] in ("go", "typescript") and not plugin_toml.is_file():
+        label = "Go" if out["language"] == "go" else "TypeScript"
+        raise PolicyError(f"unknown {label} plugin: {out['plugin_dir']}")
     if plugin_toml.is_file():
         meta = _load(plugin_toml)
         out["coordinate"] = meta["plugin"]["coordinate"]
@@ -150,6 +158,14 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
         out["github_prerelease"] = "true" if github_prerelease(release_version(out["language"], out["version"]), meta["plugin"]["maturity"]) else "false"
         if out["language"] == "python":
             out["requires_python"] = _load(plugin_toml.parent / "pyproject.toml")["project"]["requires-python"]
+        elif out["language"] == "typescript":
+            package = json.loads((plugin_toml.parent / "package.json").read_text())
+            expected = f"@temporalio/{out['plugin']}"
+            if (meta["plugin"].get("name") != out["plugin"] or meta["plugin"].get("language") != "typescript"
+                    or meta["plugin"].get("registry") != "npm" or out["coordinate"] != expected
+                    or package.get("name") != expected):
+                raise PolicyError("TypeScript tag, plugin metadata and package name must match")
+            out["dist_tag"] = "next" if out["prerelease"] == "true" else "latest"
         elif out["language"] == "go":
             plugin = meta["plugin"]
             if plugin.get("language") != "go" or plugin.get("name") != out["plugin"] or plugin.get("registry") != "goproxy":
@@ -195,6 +211,11 @@ def fetch_published_versions(coordinate: str, registry: str, registry_json: Path
     """Return every published version (yanked included). 404 -> []. Anything else fails closed."""
     if registry == "goproxy":
         return fetch_versions(coordinate, registry_json)
+    if registry == "npm":
+        try:
+            return fetch_npm_versions(coordinate, registry_json)
+        except NpmReleaseError as exc:
+            raise PolicyError(str(exc)) from exc
     if registry == "maven":
         return fetch_maven_versions(coordinate, registry_json)
     if registry not in REGISTRY_JSON:
@@ -299,7 +320,7 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     registry = meta["plugin"].get("registry", "pypi")
     if registry == "maven" and not JAVA_VERSION_RE.fullmatch(args.version):
         raise PolicyError("Maven release versions must be X.Y.Z or X.Y.Z-RCN")
-    language = {"goproxy": "go", "maven": "java"}.get(registry, "python")
+    language = {"goproxy": "go", "maven": "java", "npm": "typescript"}.get(registry, "python")
     version = release_version(language, args.version)
     published = fetch_published_versions(coordinate, registry, Path(args.registry_json) if args.registry_json else None)
     # A Go tag is already public when this job starts. A proxy listing containing
@@ -755,6 +776,26 @@ def cmd_verify_go_module(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_npm_registry_state(args: argparse.Namespace) -> int:
+    """Skip an existing upload only after proving its bytes match; retry propagation."""
+    release_version("typescript", args.version)
+    if args.attempts < 1 or args.delay < 0:
+        raise PolicyError("npm verification needs positive attempts and nonnegative delay")
+    for attempt in range(args.attempts):
+        try:
+            exists = registry_state(args.coordinate, args.version, Path(args.dist))
+            if exists or not args.require_present:
+                _write_outputs(args.github_output, {"exists": "true" if exists else "false"})
+                return 0
+            error = f"npm does not yet serve {args.coordinate}@{args.version}"
+        except (NpmReleaseError, urllib.error.URLError, TimeoutError) as exc:
+            error = str(exc)
+        if attempt + 1 < args.attempts:
+            print(f"npm verification attempt {attempt + 1}: {error}")
+            time.sleep(args.delay)
+    raise PolicyError(error)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo-root", default=os.environ.get("GITHUB_WORKSPACE", "."))
@@ -788,6 +829,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--attempts", type=int, default=10)
     p.add_argument("--delay", type=float, default=30)
     p.set_defaults(func=cmd_verify_go_module)
+
+    p = sub.add_parser("npm-registry-state", help="verify existing npm bytes before skipping an upload")
+    p.add_argument("--coordinate", required=True)
+    p.add_argument("--version", required=True)
+    p.add_argument("--dist", required=True)
+    p.add_argument("--require-present", action="store_true")
+    p.add_argument("--attempts", type=int, default=1)
+    p.add_argument("--delay", type=float, default=10)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    p.set_defaults(func=cmd_npm_registry_state)
 
     p = sub.add_parser("verify-index-files", help="fail unless the index serves exactly the local distribution files")
     p.add_argument("--coordinate", required=True)
