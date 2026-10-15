@@ -1,0 +1,5 @@
+{
+  "name": "temporal-mod",
+  "version": "0.1.0",
+  "description": "Runs Claude Code's agent loop on Temporal, so every model and tool call is durable"
+}
