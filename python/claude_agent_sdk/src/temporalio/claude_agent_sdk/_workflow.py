@@ -28,6 +28,7 @@ from ._events import TOPIC, cap_event
 from ._models import (
     TOOL_CALL_INTERRUPTED,
     TOOL_CALL_NOT_RUN,
+    TOOL_CALL_REFUSED,
     TRY_AGAIN,
     AgentState,
     ConversationRef,
@@ -140,12 +141,22 @@ def _may_try_again(err: ActivityError) -> bool:
 def _failed_step(err: ActivityError, record: dict[str, Any]) -> ToolOutcome:
     """What Claude gets for a tool step that failed: whether its call ran.
 
-    Only the step itself can know that its call did not run (``ToolCallNotRun``): a
-    timeout, a lost Worker or any other failure means the call may have run. The
-    step's own error stays in Temporal: it can name the Worker's folders and
-    settings, which Claude has no use for.
+    The step can report ``ToolCallNotRun``; trusted external policy middleware can
+    report ``ToolCallRefused`` only before dispatch. A timeout, a lost Worker or
+    any other failure means the call may have run. The step's own error stays in
+    Temporal: it can name the Worker's folders and settings, which Claude has no
+    use for.
     """
     cause = err.cause
+    if isinstance(cause, ApplicationError) and cause.type == TOOL_CALL_REFUSED:
+        record["status"] = "refused"
+        return ToolOutcome(
+            content=(
+                "This call was refused by policy before execution and did not run. "
+                "Do not retry it."
+            ),
+            is_error=True,
+        )
     if isinstance(cause, ApplicationError) and cause.type == TOOL_CALL_NOT_RUN:
         record["status"] = "not run"
         return ToolOutcome(
@@ -565,7 +576,8 @@ class DurableClaudeAgent:
 
         Durable tools and Claude Code tools in ``tool_activities``. Each has ``id``,
         ``name``, ``input`` and ``status``: ``started``, ``waiting for approval``,
-        ``rejected``, ``done``, ``failed`` (its Activity failed), ``not run`` or
+        ``rejected``, ``refused`` (policy denied before execution), ``done``,
+        ``failed`` (its Activity failed), ``not run`` or
         ``interrupted`` (a Claude Code tool's step failed before or after its call
         could start), ``cancelled`` or ``unknown tool``.
         """
