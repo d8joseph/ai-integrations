@@ -8,10 +8,11 @@ from typing import Any
 from temporalio.contrib.workflow_streams import WorkflowStreamState
 
 TOOL_CALL_REFUSED = "ToolCallRefused"
-"""An external policy refused the call before dispatch. Raise an ApplicationError
-with this type and non_retryable=True only when no tool implementation was entered.
-This is a trusted Worker contract, not a claim an arbitrary tool may make. The
-Workflow reports refusal without exposing the policy's private error message."""
+"""Type of the ``ApplicationError`` that trusted Worker middleware raises when its
+policy refuses a call before the Activity body runs: a Claude Code tool's step or a
+durable tool. Only middleware that never entered the tool may raise it; it is not a
+claim an arbitrary tool may make. The plugin never retries it, and Claude is told the
+call was refused and did not run, without the policy's own message."""
 
 TOOL_CALL_NOT_RUN = "ToolCallNotRun"
 """Type of the ``ApplicationError`` of a tool step that failed before Claude Code ran
