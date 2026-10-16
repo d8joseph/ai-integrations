@@ -290,3 +290,10 @@ make test   # the real Claude Code engine against a local fake Messages API; no 
 ```
 
 `tests/test_replay.py` replays recorded Workflow histories of every scenario in `tests/record_histories.py`, and of each scenario the plugin as first published could run, recorded with that version, so a change that would break running Workflows fails a test. `python -m tests.record_histories NAME ...` records the named scenarios again (all of them, without names): after adding a scenario, record only that one, so the other files stay as they are.
+
+## External authorization example
+
+[Task-scoped authorization with Tenuo](examples/tenuo_authorization) composes an
+external Worker policy layer with `run_claude_tool_step`, including argument
+constraints and tests proving zero tool invocations on denial. Its README
+distinguishes boundary validation from the pending full engine/Worker run.

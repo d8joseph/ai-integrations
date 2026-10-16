@@ -1,0 +1,6 @@
+tenuo[temporal]==0.3.2
+temporalio==1.34.0
+claude-agent-sdk==0.2.153
+pytest>=8,<10
+pytest-asyncio>=1,<2
+pytest-timeout~=2.2
